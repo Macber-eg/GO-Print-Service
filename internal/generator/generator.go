@@ -4,7 +4,7 @@ import (
 	"badge-service/internal/cache"
 	"badge-service/internal/models"
 	"bytes"
-	"encoding/base64"
+	"crypto/md5"
 	"fmt"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -23,14 +23,14 @@ import (
 
 // PDFGenerator handles PDF generation for badges
 type PDFGenerator struct {
-	template        *models.Template
-	user            *models.User
-	pdf             *gofpdf.Fpdf
-	imageCache      map[string]string // URL -> local path (for backward compatibility)
-	imageBase64Cache map[string]string // URL -> base64 string (preferred, faster)
-	scaleFactor     float64           // Scale from mm to points
-	dpi             int               // DPI from template settings for font size conversion
-	debugLog        bool              // Enable debug logging
+	template    *models.Template
+	user        *models.User
+	pdf         *gofpdf.Fpdf
+	imageCache  map[string]string // URL -> local path (for backward compatibility)
+	imageDataCache map[string][]byte // URL -> raw PNG bytes (preferred, fastest - no base64, no files)
+	scaleFactor float64           // Scale from mm to points
+	dpi         int               // DPI from template settings for font size conversion
+	debugLog    bool              // Enable debug logging
 }
 
 // NewPDFGenerator creates a new PDF generator instance
@@ -88,14 +88,14 @@ func NewPDFGenerator(template *models.Template, user *models.User) *PDFGenerator
 	debugLog := os.Getenv("DEBUG_PDF") == "true"
 	
 	return &PDFGenerator{
-		template:         template,
-		user:             user,
-		pdf:              pdf,
-		imageCache:       make(map[string]string),
-		imageBase64Cache: make(map[string]string),
-		scaleFactor:      1.0,
-		dpi:              dpi,
-		debugLog:         debugLog,
+		template:      template,
+		user:          user,
+		pdf:           pdf,
+		imageCache:    make(map[string]string),
+		imageDataCache: make(map[string][]byte),
+		scaleFactor:   1.0,
+		dpi:           dpi,
+		debugLog:      debugLog,
 	}
 }
 
@@ -104,9 +104,9 @@ func (g *PDFGenerator) SetImageCache(cache map[string]string) {
 	g.imageCache = cache
 }
 
-// SetImageBase64Cache sets pre-fetched images as base64 strings (preferred, faster)
-func (g *PDFGenerator) SetImageBase64Cache(cache map[string]string) {
-	g.imageBase64Cache = cache
+// SetImageDataCache sets pre-fetched images as raw PNG bytes (preferred, fastest - no base64, no files)
+func (g *PDFGenerator) SetImageDataCache(cache map[string][]byte) {
+	g.imageDataCache = cache
 }
 
 // Generate creates the PDF and returns the bytes
@@ -345,18 +345,36 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		imageURL = g.user.GetFieldValue(fieldID)
 		imageSource = "dataBinding:" + fieldID
 		
+		// Enhanced debugging for dataBinding lookup
+		if g.debugLog {
+			fmt.Printf("Debug: dataBinding lookup for layer '%s': fieldID='%s', found URL='%s'\n", 
+				layer.ID, fieldID, imageURL)
+			// Log all available field IDs for comparison
+			if imageURL == "" {
+				fmt.Printf("Debug: Available customFieldValues fieldIDs: ")
+				for i, cf := range g.user.CustomFieldValues {
+					if i > 0 {
+						fmt.Printf(", ")
+					}
+					fmt.Printf("'%s'", cf.FieldID)
+				}
+				fmt.Printf("\n")
+			}
+		}
+		
 		// Debug logging if field not found
 		if imageURL == "" {
 			fmt.Printf("Warning: dataBinding field '%s' not found or empty for layer '%s'\n", fieldID, layer.ID)
 			// Check if field exists but has empty value
-			if g.debugLog {
-				for _, cf := range g.user.CustomFieldValues {
-					if cf.FieldID == fieldID {
-						fmt.Printf("Debug: Field '%s' exists but value is empty or not a valid URL\n", fieldID)
-						break
-					}
+			for _, cf := range g.user.CustomFieldValues {
+				if cf.FieldID == fieldID {
+					fmt.Printf("Debug: Field '%s' exists but value is empty or not a valid URL (value: '%s')\n", 
+						fieldID, cf.Value)
+					break
 				}
 			}
+		} else if g.debugLog {
+			fmt.Printf("Debug: Successfully found image URL from dataBinding '%s': %s\n", fieldID, imageURL)
 		}
 	} else if layer.Content != "" && (strings.HasPrefix(layer.Content, "http://") || strings.HasPrefix(layer.Content, "https://")) {
 		imageURL = layer.Content
@@ -390,36 +408,28 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		// TODO: Implement rotation using imaging library to pre-rotate the image
 	}
 	
-	// PREFERRED: Use base64 cache if available (much faster, no file I/O)
-	if base64Data, ok := g.imageBase64Cache[imageURL]; ok {
+	// PREFERRED: Use direct image data cache (raw bytes, fastest - no base64, no files)
+	if imageData, ok := g.imageDataCache[imageURL]; ok {
 		if g.debugLog {
-			fmt.Printf("Debug: Using base64 image for layer '%s' (size: %dx%dmm)\n", 
-				layer.ID, int(layer.Size.Width), int(layer.Size.Height))
-		}
-		// Determine image type from URL or base64 data
-		imageType := getImageTypeFromURL(imageURL)
-		if imageType == "" {
-			imageType = "PNG" // Default for base64 (already processed)
+			fmt.Printf("Debug: Using cached image data for layer '%s' (size: %dx%dmm, bytes: %d)\n", 
+				layer.ID, int(layer.Size.Width), int(layer.Size.Height), len(imageData))
 		}
 		
-		// Register image from base64 and get name
+		// Generate unique image name for gofpdf registration
 		imageName := fmt.Sprintf("img_%s", strings.ReplaceAll(imageURL, "/", "_"))
 		imageName = strings.ReplaceAll(imageName, ":", "_")
 		imageName = strings.ReplaceAll(imageName, ".", "_")
+		// Add hash to ensure uniqueness (use first 8 bytes of MD5)
+		hash := md5.Sum([]byte(imageURL))
+		imageName = fmt.Sprintf("%s_%x", imageName, hash[:8])
 		
-		// Decode base64 to bytes
-		imageData, err := base64.StdEncoding.DecodeString(base64Data)
-		if err != nil {
-			return fmt.Errorf("layer '%s': failed to decode base64 image: %w", layer.ID, err)
-		}
-		
-		// Register the image with gofpdf
+		// Register the image with gofpdf using raw bytes (no base64 encoding/decoding)
 		info := g.pdf.RegisterImageOptionsReader(imageName, gofpdf.ImageOptions{
-			ImageType: imageType,
+			ImageType: "PNG", // All processed images are PNG
 		}, bytes.NewReader(imageData))
 		
 		if info == nil {
-			return fmt.Errorf("layer '%s': failed to register base64 image", layer.ID)
+			return fmt.Errorf("layer '%s': failed to register image data", layer.ID)
 		}
 		
 		// Draw the registered image
@@ -428,7 +438,7 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 			x, y,
 			layer.Size.Width, layer.Size.Height,
 			false,
-			gofpdf.ImageOptions{ImageType: imageType},
+			gofpdf.ImageOptions{ImageType: "PNG"},
 			0, "",
 		)
 		return nil
@@ -436,7 +446,7 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	
 	// FALLBACK: Use file path (backward compatibility, slower)
 	if g.debugLog {
-		fmt.Printf("Debug: Using file path for layer '%s' (base64 not available)\n", layer.ID)
+		fmt.Printf("Debug: Using file path for layer '%s' (image data cache not available)\n", layer.ID)
 	}
 	
 	// Get cached image path

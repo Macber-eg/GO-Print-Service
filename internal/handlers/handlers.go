@@ -53,55 +53,88 @@ func GenerateBadge(c *fiber.Ctx) error {
 		})
 	}
 	
-	// Pre-cache template background and user photos
-	var imageURLs []string
+	// Collect image requests with dimensions for direct loading
+	var imageRequests []cache.ImageRequest
 	
-	// Collect template assets
-	for _, url := range req.Template.Assets {
-		if url != "" {
-			imageURLs = append(imageURLs, url)
-		}
+	// Get DPI from template settings
+	dpi := req.Template.Design.Settings.DPI
+	if dpi == 0 {
+		dpi = 300 // Default DPI
 	}
 	
-	// Collect user photos from customFieldValues
-	for _, cf := range req.User.User.CustomFieldValues {
-		if cf.FieldType == "file" && cf.Value != "" && (strings.HasPrefix(cf.Value, "http://") || strings.HasPrefix(cf.Value, "https://")) {
-			imageURLs = append(imageURLs, cf.Value)
-		}
-	}
-	
-	// Also check dataBinding fields in template layers to ensure all images are preloaded
-	for _, layer := range req.Template.Design.Layers {
-		if layer.Type == "image" && layer.DataBinding != "" {
-			fieldID := strings.TrimPrefix(layer.DataBinding, "customFields.")
-			imageURL := req.User.User.GetFieldValue(fieldID)
-			if imageURL != "" && (strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://")) {
-				// Check if already in list
+	// Helper function to recursively collect image layers
+	var collectImageLayers func(layers []models.Layer)
+	collectImageLayers = func(layers []models.Layer) {
+		for _, layer := range layers {
+			if !layer.Visible {
+				continue
+			}
+			
+			var imageURL string
+			
+			// Check if this is an asset reference
+			if strings.HasPrefix(layer.Content, "asset_") {
+				// Try exact match first
+				if url, ok := req.Template.Assets[layer.Content]; ok {
+					imageURL = url
+				} else {
+					// Fallback: find asset URL with contains match
+					for key, url := range req.Template.Assets {
+						if strings.Contains(key, layer.Content) {
+							imageURL = url
+							break
+						}
+					}
+				}
+			} else if layer.DataBinding != "" {
+				// Get image URL from user data binding
+				fieldID := strings.TrimPrefix(layer.DataBinding, "customFields.")
+				imageURL = req.User.User.GetFieldValue(fieldID)
+			} else if layer.Content != "" && (strings.HasPrefix(layer.Content, "http://") || strings.HasPrefix(layer.Content, "https://")) {
+				imageURL = layer.Content
+			}
+			
+			// If we found an image URL and it's an image layer, add to requests
+			if imageURL != "" && layer.Type == "image" {
+				// Check if already in requests (deduplication)
 				found := false
-				for _, url := range imageURLs {
-					if url == imageURL {
+				for _, req := range imageRequests {
+					if req.URL == imageURL && req.Width == layer.Size.Width && req.Height == layer.Size.Height {
 						found = true
 						break
 					}
 				}
 				if !found {
-					imageURLs = append(imageURLs, imageURL)
+					imageRequests = append(imageRequests, cache.ImageRequest{
+						URL:    imageURL,
+						Width:  layer.Size.Width,
+						Height: layer.Size.Height,
+						DPI:    dpi,
+					})
 				}
+			}
+			
+			// Recursively check container children
+			if layer.Type == "container" && len(layer.Children) > 0 {
+				collectImageLayers(layer.Children)
 			}
 		}
 	}
 	
-	// Pre-fetch all images as base64 (faster, no file I/O during PDF generation)
-	var imageBase64Cache map[string]string
-	if len(imageURLs) > 0 {
-		imageBase64Cache = cache.PreloadImagesAsBase64(imageURLs)
+	// Collect all image layers recursively
+	collectImageLayers(req.Template.Design.Layers)
+	
+	// Pre-fetch all images with dimensions (direct loading, in-memory processing)
+	var imageDataCache map[string][]byte
+	if len(imageRequests) > 0 {
+		imageDataCache = cache.PreloadImagesDirect(imageRequests)
 	} else {
-		imageBase64Cache = make(map[string]string)
+		imageDataCache = make(map[string][]byte)
 	}
 	
 	// Generate PDF
 	gen := generator.NewPDFGenerator(&req.Template, &req.User.User)
-	gen.SetImageBase64Cache(imageBase64Cache)
+	gen.SetImageDataCache(imageDataCache)
 	
 	pdfBytes, err := gen.Generate()
 	if err != nil {
@@ -191,8 +224,76 @@ func GenerateBadgeBatch(c *fiber.Ctx) error {
 		}
 	}
 	
-	// Pre-fetch all images as base64 concurrently (faster)
-	imageBase64Cache := cache.PreloadImagesAsBase64(imageURLs)
+	// Collect image requests with dimensions for all users
+	var imageRequests []cache.ImageRequest
+	
+	// Get DPI from template settings
+	dpi := req.Template.Design.Settings.DPI
+	if dpi == 0 {
+		dpi = 300 // Default DPI
+	}
+	
+	// Helper function to recursively collect image layers
+	var collectImageLayers func(layers []models.Layer, user *models.User)
+	collectImageLayers = func(layers []models.Layer, user *models.User) {
+		for _, layer := range layers {
+			if !layer.Visible {
+				continue
+			}
+			
+			var imageURL string
+			
+			// Check if this is an asset reference
+			if strings.HasPrefix(layer.Content, "asset_") {
+				if url, ok := req.Template.Assets[layer.Content]; ok {
+					imageURL = url
+				} else {
+					for key, url := range req.Template.Assets {
+						if strings.Contains(key, layer.Content) {
+							imageURL = url
+							break
+						}
+					}
+				}
+			} else if layer.DataBinding != "" {
+				fieldID := strings.TrimPrefix(layer.DataBinding, "customFields.")
+				imageURL = user.GetFieldValue(fieldID)
+			} else if layer.Content != "" && (strings.HasPrefix(layer.Content, "http://") || strings.HasPrefix(layer.Content, "https://")) {
+				imageURL = layer.Content
+			}
+			
+			if imageURL != "" && layer.Type == "image" {
+				// Deduplicate by URL+dimensions
+				found := false
+				for _, req := range imageRequests {
+					if req.URL == imageURL && req.Width == layer.Size.Width && req.Height == layer.Size.Height {
+						found = true
+						break
+					}
+				}
+				if !found {
+					imageRequests = append(imageRequests, cache.ImageRequest{
+						URL:    imageURL,
+						Width:  layer.Size.Width,
+						Height: layer.Size.Height,
+						DPI:    dpi,
+					})
+				}
+			}
+			
+			if layer.Type == "container" && len(layer.Children) > 0 {
+				collectImageLayers(layer.Children, user)
+			}
+		}
+	}
+	
+	// Collect image layers for first user (template structure is same for all)
+	if len(req.Users) > 0 {
+		collectImageLayers(req.Template.Design.Layers, &req.Users[0].User)
+	}
+	
+	// Pre-fetch all images with dimensions (direct loading)
+	imageDataCache := cache.PreloadImagesDirect(imageRequests)
 	
 	// Generate PDFs concurrently
 	results := make([]models.BadgeResult, len(req.Users))
@@ -213,7 +314,7 @@ func GenerateBadgeBatch(c *fiber.Ctx) error {
 			
 			// Generate PDF
 			gen := generator.NewPDFGenerator(&req.Template, &user.User)
-			gen.SetImageBase64Cache(imageBase64Cache)
+			gen.SetImageDataCache(imageDataCache)
 			
 			pdfBytes, err := gen.Generate()
 			if err != nil {

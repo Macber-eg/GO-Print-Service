@@ -22,6 +22,9 @@ var (
 	// In-memory cache for small data
 	memCache *gocache.Cache
 	
+	// In-memory cache for processed image data (raw bytes)
+	imageDataCache *gocache.Cache
+	
 	// File cache directory
 	fileCacheDir string
 	
@@ -39,6 +42,9 @@ func Init(cacheDir string) {
 		// Initialize memory cache (5 min default, 10 min cleanup)
 		memCache = gocache.New(5*time.Minute, 10*time.Minute)
 		
+		// Initialize image data cache (10 min TTL, 20 min cleanup) for processed images
+		imageDataCache = gocache.New(10*time.Minute, 20*time.Minute)
+		
 		// Set file cache directory
 		fileCacheDir = cacheDir
 		if fileCacheDir == "" {
@@ -51,14 +57,15 @@ func Init(cacheDir string) {
 		os.MkdirAll(filepath.Join(fileCacheDir, "templates"), 0755)
 		os.MkdirAll(filepath.Join(fileCacheDir, "qrcodes"), 0755)
 		
-		// HTTP client with optimized timeout and connection pooling
+		// HTTP client with optimized timeout, connection pooling, and compression
 		transport := &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
+			MaxIdleConns:        200,
+			MaxIdleConnsPerHost: 50,
 			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  false, // Enable compression (gzip/deflate)
 		}
 		httpClient = &http.Client{
-			Timeout:   10 * time.Second, // Reduced from 30s for faster failure detection
+			Timeout:   5 * time.Second, // Reduced to 5s for faster failure detection
 			Transport: transport,
 		}
 	})
@@ -244,6 +251,128 @@ func getImageAsBase64(url string) (string, error) {
 	base64Data := base64.StdEncoding.EncodeToString(buf.Bytes())
 	
 	return base64Data, nil
+}
+
+// ============ DIRECT IMAGE DATA CACHING (RAW BYTES) ============
+
+// ImageRequest represents an image to be loaded with specific dimensions
+type ImageRequest struct {
+	URL    string
+	Width  float64 // in mm
+	Height float64 // in mm
+	DPI    int     // DPI for size calculation
+}
+
+// GetImageDataDirect downloads an image, resizes to exact size, and returns raw PNG bytes
+// All processing is done in memory - zero file I/O
+func GetImageDataDirect(url string, widthMM, heightMM float64, dpi int) ([]byte, error) {
+	if url == "" {
+		return nil, fmt.Errorf("empty URL")
+	}
+	
+	// Generate cache key with dimensions for size-specific caching
+	hash := md5.Sum([]byte(url))
+	urlHash := hex.EncodeToString(hash[:])
+	cacheKey := fmt.Sprintf("img_data:%s_%.1f_%.1f_%d", urlHash, widthMM, heightMM, dpi)
+	
+	// Check cache first (fast path)
+	if cached, found := imageDataCache.Get(cacheKey); found {
+		return cached.([]byte), nil
+	}
+	
+	// Calculate exact pixel dimensions
+	pixelWidth := int(widthMM * float64(dpi) / 25.4)
+	pixelHeight := int(heightMM * float64(dpi) / 25.4)
+	
+	// Download image
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status: %s", resp.Status)
+	}
+	
+	// Read image data into memory
+	imageData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read image data: %w", err)
+	}
+	
+	// Decode image using imaging library (supports WebP, PNG, JPG, GIF)
+	img, err := imaging.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode image: %w", err)
+	}
+	
+	// Get original dimensions
+	bounds := img.Bounds()
+	origWidth := bounds.Dx()
+	origHeight := bounds.Dy()
+	
+	// Resize if needed (only if larger than target or significantly different)
+	// Use fast resize algorithm for performance
+	if origWidth > pixelWidth || origHeight > pixelHeight {
+		// Resize to exact dimensions using Lanczos (fast, good quality)
+		img = imaging.Resize(img, pixelWidth, pixelHeight, imaging.Lanczos)
+	} else if origWidth != pixelWidth || origHeight != pixelHeight {
+		// If smaller, still resize to exact dimensions (for consistency)
+		img = imaging.Resize(img, pixelWidth, pixelHeight, imaging.Lanczos)
+	}
+	
+	// Normalize to 8-bit NRGBA (gofpdf requirement)
+	nrgba := imaging.Clone(img)
+	
+	// Encode as PNG in memory
+	var buf bytes.Buffer
+	err = imaging.Encode(&buf, nrgba, imaging.PNG)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode PNG: %w", err)
+	}
+	
+	// Get processed bytes
+	processedBytes := buf.Bytes()
+	
+	// Cache the processed bytes
+	imageDataCache.Set(cacheKey, processedBytes, gocache.DefaultExpiration)
+	
+	return processedBytes, nil
+}
+
+// PreloadImagesDirect downloads and processes multiple images in parallel
+// Returns map of URL -> raw PNG bytes (not base64, not file paths)
+func PreloadImagesDirect(requests []ImageRequest) map[string][]byte {
+	results := make(map[string][]byte)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// Limit concurrent downloads/processing
+	sem := make(chan struct{}, 50)
+	
+	for _, req := range requests {
+		if req.URL == "" {
+			continue
+		}
+		
+		wg.Add(1)
+		go func(r ImageRequest) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			
+			imageData, err := GetImageDataDirect(r.URL, r.Width, r.Height, r.DPI)
+			if err == nil {
+				mu.Lock()
+				results[r.URL] = imageData
+				mu.Unlock()
+			}
+		}(req)
+	}
+	
+	wg.Wait()
+	return results
 }
 
 // ============ QR CODE CACHING ============
