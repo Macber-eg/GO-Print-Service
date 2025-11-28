@@ -53,7 +53,7 @@ func GenerateBadge(c *fiber.Ctx) error {
 		})
 	}
 	
-	// Pre-cache template background
+	// Pre-cache template background and user photos
 	var imageURLs []string
 	for _, url := range req.Template.Assets {
 		imageURLs = append(imageURLs, url)
@@ -66,8 +66,13 @@ func GenerateBadge(c *fiber.Ctx) error {
 		}
 	}
 	
-	// Pre-fetch all images
-	imageCache := cache.PreloadImages(imageURLs)
+	// Pre-fetch all images (only if there are images to fetch)
+	var imageCache map[string]string
+	if len(imageURLs) > 0 {
+		imageCache = cache.PreloadImages(imageURLs)
+	} else {
+		imageCache = make(map[string]string)
+	}
 	
 	// Generate PDF
 	gen := generator.NewPDFGenerator(&req.Template, &req.User.User)

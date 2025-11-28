@@ -5,8 +5,6 @@ import (
 	"badge-service/internal/models"
 	"bytes"
 	"fmt"
-	"image"
-	"image/color"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -248,15 +246,10 @@ func (g *PDFGenerator) renderQRCode(layer models.Layer, x, y float64) error {
 		}
 	}
 	
-	// Normalize QR code PNG to 8-bit depth (gofpdf doesn't support 16-bit PNGs)
-	normalizedQRPath, err := normalizePNGTo8Bit(qrPath)
-	if err != nil {
-		return fmt.Errorf("failed to normalize QR code PNG: %w", err)
-	}
-	
+	// QR codes are always generated as 8-bit PNG, no normalization needed
 	// Draw QR code image
 	g.pdf.ImageOptions(
-		normalizedQRPath,
+		qrPath,
 		x, y,
 		layer.Size.Width, layer.Size.Height,
 		false,
@@ -327,10 +320,13 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	}
 	
 	// Normalize PNG to 8-bit depth (gofpdf doesn't support 16-bit PNGs)
+	// Only normalize if it's a PNG (skip for JPG, GIF, etc.)
 	if imageType == "PNG" {
 		normalizedPath, err := normalizePNGTo8Bit(imagePath)
 		if err != nil {
-			return fmt.Errorf("failed to normalize PNG: %w", err)
+			// If normalization fails, try using original (might already be 8-bit)
+			// This allows fallback for edge cases
+			normalizedPath = imagePath
 		}
 		imagePath = normalizedPath
 	}
@@ -574,24 +570,17 @@ func convertWebPToPNG(webpPath string) (string, error) {
 	
 	// Check if already converted
 	if _, err := os.Stat(pngPath); err == nil {
-		// Still normalize to ensure 8-bit depth
+		// WebP conversion already produces 8-bit PNG, but normalize to be safe
 		return normalizePNGTo8Bit(pngPath)
 	}
 	
-	// Open WebP file
-	file, err := os.Open(webpPath)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	
-	// Decode image
-	img, _, err := image.Decode(file)
+	// Open WebP file using imaging library
+	img, err := imaging.Open(webpPath)
 	if err != nil {
 		return "", err
 	}
 	
-	// Save as PNG using imaging library (will be 8-bit)
+	// Save as 8-bit PNG using imaging library
 	err = imaging.Save(img, pngPath)
 	if err != nil {
 		return "", err
@@ -602,6 +591,7 @@ func convertWebPToPNG(webpPath string) (string, error) {
 
 // normalizePNGTo8Bit converts a PNG image to 8-bit depth if needed
 // gofpdf doesn't support 16-bit PNG files
+// Uses imaging library for fast conversion
 func normalizePNGTo8Bit(pngPath string) (string, error) {
 	// Use a normalized path with a suffix to avoid conflicts
 	normalizedPath := pngPath + ".8bit.png"
@@ -611,38 +601,15 @@ func normalizePNGTo8Bit(pngPath string) (string, error) {
 		return normalizedPath, nil
 	}
 	
-	// Open PNG file
-	file, err := os.Open(pngPath)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	
-	// Decode image
-	img, _, err := image.Decode(file)
+	// Open and decode image
+	img, err := imaging.Open(pngPath)
 	if err != nil {
 		return "", err
 	}
 	
-	// Convert to NRGBA format (8-bit per channel) to ensure 8-bit depth
-	// This explicitly converts any 16-bit images to 8-bit
-	// Use imaging to convert to NRGBA which guarantees 8-bit per channel
-	bounds := img.Bounds()
-	nrgba := image.NewNRGBA(bounds)
-	
-	// Copy pixels, which will convert from any format (including 16-bit) to 8-bit NRGBA
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			r, g, b, a := img.At(x, y).RGBA()
-			// Convert from 16-bit RGBA to 8-bit NRGBA
-			nrgba.SetNRGBA(x, y, color.NRGBA{
-				R: uint8(r >> 8),
-				G: uint8(g >> 8),
-				B: uint8(b >> 8),
-				A: uint8(a >> 8),
-			})
-		}
-	}
+	// Convert to NRGBA using imaging library (much faster than pixel-by-pixel)
+	// This automatically handles 16-bit to 8-bit conversion
+	nrgba := imaging.Clone(img)
 	
 	// Save as 8-bit PNG using imaging library
 	// NRGBA format ensures 8-bit depth
