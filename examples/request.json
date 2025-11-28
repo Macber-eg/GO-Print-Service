@@ -1,0 +1,154 @@
+{
+  "template": {
+    "id": 9,
+    "adminId": "7278770c-be15-4029-9c53-77a524dce22f",
+    "eventId": 60,
+    "name": "EXHIBITOR",
+    "design": {
+      "layers": [
+        {
+          "id": "layer-background",
+          "type": "image",
+          "content": "asset_0",
+          "position": { "x": 0, "y": 0 },
+          "size": { "width": 210, "height": 297 },
+          "style": {
+            "opacity": 1
+          },
+          "zIndex": 0,
+          "visible": true
+        },
+        {
+          "id": "layer-qrcode",
+          "type": "qrcode",
+          "content": "",
+          "position": { "x": 10, "y": 50 },
+          "size": { "width": 28.35, "height": 28.35 },
+          "style": {},
+          "zIndex": 1,
+          "visible": true
+        },
+        {
+          "id": "layer-photo",
+          "type": "image",
+          "content": "",
+          "dataBinding": "customFields.d1c3dc73-86ef-47b0-af79-bc5047f2c100",
+          "position": { "x": 45, "y": 50 },
+          "size": { "width": 26.1, "height": 39.6 },
+          "style": {},
+          "zIndex": 2,
+          "visible": true
+        },
+        {
+          "id": "layer-name",
+          "type": "text",
+          "content": "{{customFields.4dd704b2-9aa2-4651-b8eb-0e508b6a19e5}} {{customFields.de4a02ae-33b6-4cf3-afc8-488fa09504df}} {{customFields.cfd8df63-7bfc-4935-a7c1-3b37d2ccca9e}}",
+          "position": { "x": 10, "y": 100 },
+          "size": { "width": 90, "height": 10 },
+          "style": {
+            "fontSize": 60,
+            "fontFamily": "Arial",
+            "fontWeight": "bold",
+            "color": "#000000",
+            "textAlign": "center"
+          },
+          "autoFontSize": true,
+          "zIndex": 3,
+          "visible": true
+        },
+        {
+          "id": "layer-jobtitle",
+          "type": "text",
+          "content": "{{customFields.d405b4ed-a1c8-4a15-8d97-4a378818acf2}}",
+          "position": { "x": 10, "y": 115 },
+          "size": { "width": 90, "height": 10 },
+          "style": {
+            "fontSize": 40,
+            "fontFamily": "Arial",
+            "fontWeight": "normal",
+            "color": "#000000",
+            "textAlign": "center"
+          },
+          "autoFontSize": true,
+          "zIndex": 4,
+          "visible": true
+        },
+        {
+          "id": "layer-company",
+          "type": "text",
+          "content": "{{customFields.4e35546b-1ac0-4bae-b26f-5f4889a6be4d}}",
+          "position": { "x": 10, "y": 130 },
+          "size": { "width": 90, "height": 10 },
+          "style": {
+            "fontSize": 40,
+            "fontFamily": "Arial",
+            "fontWeight": "normal",
+            "color": "#333333",
+            "textAlign": "center"
+          },
+          "autoFontSize": true,
+          "zIndex": 5,
+          "visible": true
+        }
+      ],
+      "settings": {
+        "paperWidth": 210,
+        "paperHeight": 297,
+        "dpi": 300,
+        "orientation": "portrait"
+      }
+    },
+    "assets": {
+      "asset_0": "https://macber-registration.s3.eu-north-1.amazonaws.com/uploads/7278770c-be15-4029-9c53-77a524dce22f_badge_template_update_20251119_132559.png"
+    },
+    "width": 210,
+    "height": 297
+  },
+  "user": {
+    "user": {
+      "id": "2e2b614d-f338-4415-98be-e931e3f8379b",
+      "firstName": "Mahmoud",
+      "lastName": "Ossman",
+      "email": "Mahmoudshawky793@gmail.com",
+      "identifier": "7882919302",
+      "customFieldValues": [
+        {
+          "fieldId": "d1c3dc73-86ef-47b0-af79-bc5047f2c100",
+          "name": "Photo",
+          "fieldType": "file",
+          "value": "https://macber-registration.s3.eu-north-1.amazonaws.com/uploads/7882919302_d1c3dc73-86ef-47b0-af79-bc5047f2c100_20251128_103052.webp"
+        },
+        {
+          "fieldId": "4dd704b2-9aa2-4651-b8eb-0e508b6a19e5",
+          "name": "Title",
+          "fieldType": "select",
+          "value": "Mr"
+        },
+        {
+          "fieldId": "de4a02ae-33b6-4cf3-afc8-488fa09504df",
+          "name": "First Name",
+          "fieldType": "text",
+          "value": "Mahmoud"
+        },
+        {
+          "fieldId": "cfd8df63-7bfc-4935-a7c1-3b37d2ccca9e",
+          "name": "Last name",
+          "fieldType": "text",
+          "value": "Ossman"
+        },
+        {
+          "fieldId": "d405b4ed-a1c8-4a15-8d97-4a378818acf2",
+          "name": "Job Title",
+          "fieldType": "text",
+          "value": "Assistant Logistics Coordinator"
+        },
+        {
+          "fieldId": "4e35546b-1ac0-4bae-b26f-5f4889a6be4d",
+          "name": "Company or Organisation Name",
+          "fieldType": "text",
+          "value": "Assubur Consult"
+        }
+      ]
+    }
+  }
+}
