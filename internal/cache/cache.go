@@ -3,9 +3,9 @@ package cache
 import (
 	"bytes"
 	"crypto/md5"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"image"
 	"io"
 	"net/http"
 	"os"
@@ -13,10 +13,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chai2010/webp"
 	"github.com/disintegration/imaging"
 	gocache "github.com/patrickmn/go-cache"
 	_ "golang.org/x/image/webp"
 )
+
+// Buffer pool for reusing bytes.Buffer to reduce allocations
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
 
 var (
 	// In-memory cache for small data
@@ -39,11 +47,11 @@ var (
 
 func Init(cacheDir string) {
 	once.Do(func() {
-		// Initialize memory cache (5 min default, 10 min cleanup)
-		memCache = gocache.New(5*time.Minute, 10*time.Minute)
+		// Initialize memory cache (30 min default, 60 min cleanup) - optimized for production
+		memCache = gocache.New(30*time.Minute, 60*time.Minute)
 		
-		// Initialize image data cache (10 min TTL, 20 min cleanup) for processed images
-		imageDataCache = gocache.New(10*time.Minute, 20*time.Minute)
+		// Initialize image data cache (60 min TTL, 120 min cleanup) for processed images - optimized for production
+		imageDataCache = gocache.New(60*time.Minute, 120*time.Minute)
 		
 		// Set file cache directory
 		fileCacheDir = cacheDir
@@ -57,12 +65,13 @@ func Init(cacheDir string) {
 		os.MkdirAll(filepath.Join(fileCacheDir, "templates"), 0755)
 		os.MkdirAll(filepath.Join(fileCacheDir, "qrcodes"), 0755)
 		
-		// HTTP client with optimized timeout, connection pooling, and compression
+		// HTTP client with optimized timeout, connection pooling, compression, and HTTP/2
 		transport := &http.Transport{
-			MaxIdleConns:        200,
-			MaxIdleConnsPerHost: 50,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false, // Enable compression (gzip/deflate)
+			MaxIdleConns:        500,        // Increased for better connection reuse
+			MaxIdleConnsPerHost: 100,       // Increased per-host connections
+			IdleConnTimeout:     120 * time.Second, // Longer timeout for connection reuse
+			DisableCompression:  false,     // Enable compression (gzip/deflate)
+			ForceAttemptHTTP2:   true,      // Enable HTTP/2 for better multiplexing
 		}
 		httpClient = &http.Client{
 			Timeout:   5 * time.Second, // Reduced to 5s for faster failure detection
@@ -178,81 +187,6 @@ func PreloadImages(urls []string) map[string]string {
 	return results
 }
 
-// PreloadImagesAsBase64 downloads images and converts them to base64 strings
-// This is faster than file-based approach as it avoids file I/O during PDF generation
-func PreloadImagesAsBase64(urls []string) map[string]string {
-	results := make(map[string]string)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	
-	// Limit concurrent downloads
-	sem := make(chan struct{}, 20)
-	
-	for _, url := range urls {
-		if url == "" {
-			continue
-		}
-		
-		wg.Add(1)
-		go func(u string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			
-			base64Data, err := getImageAsBase64(u)
-			if err == nil {
-				mu.Lock()
-				results[u] = base64Data
-				mu.Unlock()
-			}
-		}(url)
-	}
-	
-	wg.Wait()
-	return results
-}
-
-// getImageAsBase64 downloads an image, processes it (WebP conversion, normalization), and returns as base64
-func getImageAsBase64(url string) (string, error) {
-	// Download image
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		return "", fmt.Errorf("failed to download: %w", err)
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("bad status: %s", resp.Status)
-	}
-	
-	// Read image data into memory
-	imageData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read image data: %w", err)
-	}
-	
-	// Decode image using imaging library (supports WebP, PNG, JPG, GIF)
-	img, err := imaging.Decode(bytes.NewReader(imageData))
-	if err != nil {
-		return "", fmt.Errorf("failed to decode image: %w", err)
-	}
-	
-	// Normalize to 8-bit NRGBA (gofpdf requirement)
-	nrgba := imaging.Clone(img)
-	
-	// Encode as PNG in memory
-	var buf bytes.Buffer
-	err = imaging.Encode(&buf, nrgba, imaging.PNG)
-	if err != nil {
-		return "", fmt.Errorf("failed to encode PNG: %w", err)
-	}
-	
-	// Convert to base64
-	base64Data := base64.StdEncoding.EncodeToString(buf.Bytes())
-	
-	return base64Data, nil
-}
-
 // ============ DIRECT IMAGE DATA CACHING (RAW BYTES) ============
 
 // ImageRequest represents an image to be loaded with specific dimensions
@@ -301,10 +235,20 @@ func GetImageDataDirect(url string, widthMM, heightMM float64, dpi int) ([]byte,
 		return nil, fmt.Errorf("failed to read image data: %w", err)
 	}
 	
-	// Decode image using imaging library (supports WebP, PNG, JPG, GIF)
-	img, err := imaging.Decode(bytes.NewReader(imageData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode image: %w", err)
+	// Detect WebP format and use appropriate decoder
+	var img image.Image
+	if isWebP(imageData) {
+		// Use chai2010/webp for better VP8X support
+		img, err = webp.Decode(bytes.NewReader(imageData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode WebP: %w", err)
+		}
+	} else {
+		// Use imaging for PNG, JPG, GIF
+		img, err = imaging.Decode(bytes.NewReader(imageData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode image: %w", err)
+		}
 	}
 	
 	// Get original dimensions
@@ -312,28 +256,53 @@ func GetImageDataDirect(url string, widthMM, heightMM float64, dpi int) ([]byte,
 	origWidth := bounds.Dx()
 	origHeight := bounds.Dy()
 	
-	// Resize if needed (only if larger than target or significantly different)
-	// Use fast resize algorithm for performance
-	if origWidth > pixelWidth || origHeight > pixelHeight {
-		// Resize to exact dimensions using Lanczos (fast, good quality)
-		img = imaging.Resize(img, pixelWidth, pixelHeight, imaging.Lanczos)
-	} else if origWidth != pixelWidth || origHeight != pixelHeight {
-		// If smaller, still resize to exact dimensions (for consistency)
-		img = imaging.Resize(img, pixelWidth, pixelHeight, imaging.Lanczos)
+	// Helper function to calculate absolute difference percentage
+	absDiff := func(a, b int) int {
+		if a > b {
+			return a - b
+		}
+		return b - a
+	}
+	
+	// Only resize if dimensions are significantly different (>10% difference)
+	// Skip resize if dimensions match or are very close
+	widthDiff := absDiff(origWidth, pixelWidth)
+	heightDiff := absDiff(origHeight, pixelHeight)
+	
+	if widthDiff > pixelWidth/10 || heightDiff > pixelHeight/10 {
+		// Use NearestNeighbor for speed (faster than Lanczos)
+		// For better quality, use imaging.Lanczos, but NearestNeighbor is much faster
+		img = imaging.Resize(img, pixelWidth, pixelHeight, imaging.NearestNeighbor)
 	}
 	
 	// Normalize to 8-bit NRGBA (gofpdf requirement)
 	nrgba := imaging.Clone(img)
 	
+	// Get buffer from pool and pre-allocate to avoid reallocations
+	// Estimate: width * height * 4 bytes for RGBA
+	estimatedSize := pixelWidth * pixelHeight * 4
+	if estimatedSize < 1024 {
+		estimatedSize = 1024 // Minimum buffer size
+	}
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if buf.Cap() < estimatedSize {
+		buf.Grow(estimatedSize)
+	}
+	defer func() {
+		buf.Reset()
+		bufferPool.Put(buf)
+	}()
+	
 	// Encode as PNG in memory
-	var buf bytes.Buffer
-	err = imaging.Encode(&buf, nrgba, imaging.PNG)
+	err = imaging.Encode(buf, nrgba, imaging.PNG)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode PNG: %w", err)
 	}
 	
-	// Get processed bytes
-	processedBytes := buf.Bytes()
+	// Get processed bytes (copy since buffer will be returned to pool)
+	processedBytes := make([]byte, buf.Len())
+	copy(processedBytes, buf.Bytes())
 	
 	// Cache the processed bytes
 	imageDataCache.Set(cacheKey, processedBytes, gocache.DefaultExpiration)
@@ -368,6 +337,7 @@ func PreloadImagesDirect(requests []ImageRequest) map[string][]byte {
 				results[r.URL] = imageData
 				mu.Unlock()
 			}
+			// Errors are silently ignored in production for performance
 		}(req)
 	}
 	
@@ -413,6 +383,15 @@ func CacheTemplateBackground(templateID int, url string) (string, error) {
 }
 
 // ============ HELPER FUNCTIONS ============
+
+// isWebP detects if image data is in WebP format by checking magic bytes
+func isWebP(data []byte) bool {
+	if len(data) < 12 {
+		return false
+	}
+	// WebP files start with "RIFF" and contain "WEBP"
+	return string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+}
 
 func downloadFile(url, destPath string) error {
 	resp, err := httpClient.Get(url)

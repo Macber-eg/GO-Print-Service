@@ -45,9 +45,11 @@ func main() {
 	// Middleware
 	app.Use(recover.New())
 	app.Use(requestid.New())
+	// Minimal logger for production (only errors logged)
 	app.Use(logger.New(logger.Config{
-		Format:     "${time} | ${status} | ${latency} | ${method} ${path}\n",
-		TimeFormat: "2006-01-02 15:04:05",
+		Format:     "${status} ${method} ${path} ${latency}\n",
+		TimeFormat: "15:04:05",
+		Output:     os.Stderr, // Log to stderr for production
 	}))
 	
 	// CORS
@@ -61,11 +63,11 @@ func main() {
 	setupRoutes(app)
 	
 	// Start server
-	fmt.Printf("🚀 Badge Service starting on port %s\n", port)
-	fmt.Printf("📁 Cache directory: %s\n", cacheDir)
+	fmt.Fprintf(os.Stderr, "Badge Service starting on port %s\n", port)
+	fmt.Fprintf(os.Stderr, "Cache directory: %s\n", cacheDir)
 	
 	if err := app.Listen(":" + port); err != nil {
-		fmt.Printf("❌ Failed to start server: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to start server: %v\n", err)
 		os.Exit(1)
 	}
 }

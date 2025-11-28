@@ -54,7 +54,8 @@ func GenerateBadge(c *fiber.Ctx) error {
 	}
 	
 	// Collect image requests with dimensions for direct loading
-	var imageRequests []cache.ImageRequest
+	// Use map for O(1) deduplication instead of O(n²) nested loop
+	imageRequestMap := make(map[string]cache.ImageRequest)
 	
 	// Get DPI from template settings
 	dpi := req.Template.Design.Settings.DPI
@@ -96,21 +97,15 @@ func GenerateBadge(c *fiber.Ctx) error {
 			
 			// If we found an image URL and it's an image layer, add to requests
 			if imageURL != "" && layer.Type == "image" {
-				// Check if already in requests (deduplication)
-				found := false
-				for _, req := range imageRequests {
-					if req.URL == imageURL && req.Width == layer.Size.Width && req.Height == layer.Size.Height {
-						found = true
-						break
-					}
-				}
-				if !found {
-					imageRequests = append(imageRequests, cache.ImageRequest{
+				// Use composite key for O(1) deduplication
+				key := fmt.Sprintf("%s_%.2f_%.2f", imageURL, layer.Size.Width, layer.Size.Height)
+				if _, exists := imageRequestMap[key]; !exists {
+					imageRequestMap[key] = cache.ImageRequest{
 						URL:    imageURL,
 						Width:  layer.Size.Width,
 						Height: layer.Size.Height,
 						DPI:    dpi,
-					})
+					}
 				}
 			}
 			
@@ -123,6 +118,12 @@ func GenerateBadge(c *fiber.Ctx) error {
 	
 	// Collect all image layers recursively
 	collectImageLayers(req.Template.Design.Layers)
+	
+	// Convert map to slice for PreloadImagesDirect
+	imageRequests := make([]cache.ImageRequest, 0, len(imageRequestMap))
+	for _, req := range imageRequestMap {
+		imageRequests = append(imageRequests, req)
+	}
 	
 	// Pre-fetch all images with dimensions (direct loading, in-memory processing)
 	var imageDataCache map[string][]byte
@@ -225,7 +226,8 @@ func GenerateBadgeBatch(c *fiber.Ctx) error {
 	}
 	
 	// Collect image requests with dimensions for all users
-	var imageRequests []cache.ImageRequest
+	// Use map for O(1) deduplication instead of O(n²) nested loop
+	imageRequestMap := make(map[string]cache.ImageRequest)
 	
 	// Get DPI from template settings
 	dpi := req.Template.Design.Settings.DPI
@@ -263,21 +265,15 @@ func GenerateBadgeBatch(c *fiber.Ctx) error {
 			}
 			
 			if imageURL != "" && layer.Type == "image" {
-				// Deduplicate by URL+dimensions
-				found := false
-				for _, req := range imageRequests {
-					if req.URL == imageURL && req.Width == layer.Size.Width && req.Height == layer.Size.Height {
-						found = true
-						break
-					}
-				}
-				if !found {
-					imageRequests = append(imageRequests, cache.ImageRequest{
+				// Use composite key for O(1) deduplication
+				key := fmt.Sprintf("%s_%.2f_%.2f", imageURL, layer.Size.Width, layer.Size.Height)
+				if _, exists := imageRequestMap[key]; !exists {
+					imageRequestMap[key] = cache.ImageRequest{
 						URL:    imageURL,
 						Width:  layer.Size.Width,
 						Height: layer.Size.Height,
 						DPI:    dpi,
-					})
+					}
 				}
 			}
 			
@@ -290,6 +286,12 @@ func GenerateBadgeBatch(c *fiber.Ctx) error {
 	// Collect image layers for first user (template structure is same for all)
 	if len(req.Users) > 0 {
 		collectImageLayers(req.Template.Design.Layers, &req.Users[0].User)
+	}
+	
+	// Convert map to slice for PreloadImagesDirect
+	imageRequests := make([]cache.ImageRequest, 0, len(imageRequestMap))
+	for _, req := range imageRequestMap {
+		imageRequests = append(imageRequests, req)
 	}
 	
 	// Pre-fetch all images with dimensions (direct loading)
