@@ -27,6 +27,7 @@ type PDFGenerator struct {
 	pdf         *gofpdf.Fpdf
 	imageCache  map[string]string // URL -> local path
 	scaleFactor float64           // Scale from mm to points
+	dpi         int               // DPI from template settings for font size conversion
 }
 
 // NewPDFGenerator creates a new PDF generator instance
@@ -74,12 +75,19 @@ func NewPDFGenerator(template *models.Template, user *models.User) *PDFGenerator
 		pdf.AddUTF8Font("Arial", "B", "fonts/arialbd.ttf")
 	}
 	
+	// Get DPI from template settings (default to 300 if not set)
+	dpi := settings.DPI
+	if dpi == 0 {
+		dpi = 300 // Standard print DPI
+	}
+	
 	return &PDFGenerator{
 		template:    template,
 		user:        user,
 		pdf:         pdf,
 		imageCache:  make(map[string]string),
 		scaleFactor: 1.0,
+		dpi:         dpi,
 	}
 }
 
@@ -154,11 +162,15 @@ func (g *PDFGenerator) renderText(layer models.Layer, x, y float64) error {
 		fontStyle = "B"
 	}
 	
-	// Calculate font size (convert from design units to PDF points)
-	// The design uses px-like units, we need to convert to mm-appropriate size
-	fontSize := layer.Style.FontSize / 5.0 // Rough conversion factor
+	// Calculate font size (convert from pixels to PDF points)
+	// Template font sizes are in pixels (px) at the template's DPI
+	// Conversion: pt = px * (72 / DPI)
+	// For 300 DPI: pt = px * 0.24
+	fontSize := layer.Style.FontSize * (72.0 / float64(g.dpi))
+	
+	// Clamp font size to reasonable bounds
 	if fontSize < 4 {
-		fontSize = 8
+		fontSize = 4
 	}
 	if fontSize > 72 {
 		fontSize = 72
@@ -267,19 +279,19 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	
 	// Check if this is an asset reference
 	if strings.HasPrefix(layer.Content, "asset_") {
-		// Find asset URL from template assets
-		for key, url := range g.template.Assets {
-			if strings.Contains(key, layer.Content) {
-				imageURL = url
-				imageSource = "asset:" + key
-				break
-			}
-		}
-		// If not found with full key, try direct match
-		if imageURL == "" {
-			if url, ok := g.template.Assets[layer.Content]; ok {
-				imageURL = url
-				imageSource = "asset:" + layer.Content
+		// Try exact match first (for cases like "asset_0" matching "asset_0")
+		if url, ok := g.template.Assets[layer.Content]; ok {
+			imageURL = url
+			imageSource = "asset:" + layer.Content
+		} else {
+			// Fallback: find asset URL with contains match (for timestamped keys like "asset_0_1763558759124")
+			for key, url := range g.template.Assets {
+				if strings.Contains(key, layer.Content) {
+					imageURL = url
+					imageSource = "asset:" + key
+					fmt.Printf("Debug: Matched asset key '%s' to layer content '%s'\n", key, layer.Content)
+					break
+				}
 			}
 		}
 	} else if layer.DataBinding != "" {
@@ -325,8 +337,13 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		// Download and cache
 		imagePath, err = cache.GetImagePath(imageURL)
 		if err != nil {
-			return fmt.Errorf("failed to get image: %w", err)
+			return fmt.Errorf("layer '%s': failed to get image from %s: %w", layer.ID, imageURL, err)
 		}
+	}
+	
+	// Validate file exists and is readable
+	if stat, err := os.Stat(imagePath); os.IsNotExist(err) || stat == nil || stat.Size() == 0 {
+		return fmt.Errorf("layer '%s': image file does not exist or is empty: %s (from %s)", layer.ID, imagePath, imageURL)
 	}
 	
 	// Determine image type
@@ -336,7 +353,11 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	if imageType == "WEBP" {
 		convertedPath, err := convertWebPToPNG(imagePath)
 		if err != nil {
-			return fmt.Errorf("failed to convert WebP: %w", err)
+			return fmt.Errorf("layer '%s': failed to convert WebP to PNG: %w", layer.ID, err)
+		}
+		// Validate converted file exists
+		if stat, err := os.Stat(convertedPath); os.IsNotExist(err) || stat == nil || stat.Size() == 0 {
+			return fmt.Errorf("layer '%s': WebP conversion failed, converted file missing: %s", layer.ID, convertedPath)
 		}
 		imagePath = convertedPath
 		imageType = "PNG"
@@ -371,7 +392,25 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		}
 	}
 	
-	// Draw image
+	// Apply opacity check (gofpdf doesn't directly support opacity in ImageOptions)
+	// For opacity < 1, we would need to pre-process the image, but for now we'll render
+	// Opacity of 0 means fully transparent, skip rendering
+	opacity := layer.Style.Opacity
+	if opacity == 0 {
+		return nil // Fully transparent, skip rendering
+	}
+	
+	// Note: Rotation is not directly supported by gofpdf's ImageOptions
+	// For rotation support, we would need to pre-process the image using imaging library
+	// For now, we'll render without rotation (most templates use rotation: 0)
+	rotation := layer.Style.Rotation
+	if rotation != 0 {
+		fmt.Printf("Warning: Image rotation (%f degrees) not yet implemented for layer '%s'\n", rotation, layer.ID)
+		// TODO: Implement rotation using imaging library to pre-rotate the image
+	}
+	
+	// Draw image (ImageOptions doesn't return error, but will panic if file is invalid)
+	// We've already validated the file exists above
 	g.pdf.ImageOptions(
 		imagePath,
 		x, y,
@@ -555,25 +594,32 @@ func (g *PDFGenerator) resolvePlaceholders(content string) string {
 }
 
 // calculateAutoFontSize finds the best font size to fit text in a box
+// Uses DPI-aware calculations to match template behavior
 func (g *PDFGenerator) calculateAutoFontSize(text string, width, height float64, fontFamily, fontStyle string) float64 {
-	// Start with a reasonable size and scale down
-	fontSize := height * 0.8
+	// Start with a reasonable size based on height (in mm, convert to points)
+	// Height is in mm, we want to use most of it for text
+	fontSize := height * 2.83 // Convert mm to points: 1mm ≈ 2.83pt
 	if fontSize > 24 {
 		fontSize = 24
 	}
 	
-	for fontSize > 4 {
-		g.pdf.SetFont(fontFamily, fontStyle, fontSize)
+	// Binary search for optimal font size
+	minSize := 4.0
+	maxSize := fontSize
+	
+	for maxSize-minSize > 0.1 {
+		testSize := (minSize + maxSize) / 2
+		g.pdf.SetFont(fontFamily, fontStyle, testSize)
 		textWidth := g.pdf.GetStringWidth(text)
 		
 		if textWidth <= width*0.95 {
-			return fontSize
+			minSize = testSize
+		} else {
+			maxSize = testSize
 		}
-		
-		fontSize -= 0.5
 	}
 	
-	return 4 // Minimum font size
+	return minSize
 }
 
 // ============ HELPER FUNCTIONS ============

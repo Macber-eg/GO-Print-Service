@@ -116,7 +116,12 @@ func GetImagePath(url string) (string, error) {
 	}
 	
 	if err := downloadFile(url, cachePath); err != nil {
-		return "", fmt.Errorf("failed to download image: %w", err)
+		return "", fmt.Errorf("failed to download image from %s: %w", url, err)
+	}
+	
+	// Validate downloaded file exists and has content
+	if stat, err := os.Stat(cachePath); err != nil || stat == nil || stat.Size() == 0 {
+		return "", fmt.Errorf("downloaded image file is invalid or empty: %s (from %s)", cachePath, url)
 	}
 	
 	memCache.Set("img:"+cacheKey, cachePath, gocache.DefaultExpiration)
