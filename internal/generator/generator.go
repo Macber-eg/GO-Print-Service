@@ -67,9 +67,13 @@ func NewPDFGenerator(template *models.Template, user *models.User) *PDFGenerator
 	pdf.SetAutoPageBreak(false, 0)
 	pdf.AddPage()
 	
-	// Add Unicode font support
-	pdf.AddUTF8Font("Arial", "", "fonts/arial.ttf")
-	pdf.AddUTF8Font("Arial", "B", "fonts/arialbd.ttf")
+	// Add Unicode font support if font files exist
+	if _, err := os.Stat("fonts/arial.ttf"); err == nil {
+		pdf.AddUTF8Font("Arial", "", "fonts/arial.ttf")
+	}
+	if _, err := os.Stat("fonts/arialbd.ttf"); err == nil {
+		pdf.AddUTF8Font("Arial", "B", "fonts/arialbd.ttf")
+	}
 	
 	return &PDFGenerator{
 		template:    template,
@@ -173,6 +177,7 @@ func (g *PDFGenerator) renderText(layer models.Layer, x, y float64) error {
 	}
 	
 	// Try to use the font, fall back to Helvetica if not available
+	// If Arial wasn't loaded (font file missing), gofpdf will automatically use Helvetica
 	g.pdf.SetFont(fontFamily, fontStyle, fontSize)
 	
 	// Set text color
