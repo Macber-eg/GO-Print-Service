@@ -1,7 +1,9 @@
 package cache
 
 import (
+	"bytes"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -11,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/disintegration/imaging"
 	gocache "github.com/patrickmn/go-cache"
+	_ "golang.org/x/image/webp"
 )
 
 var (
@@ -165,6 +169,81 @@ func PreloadImages(urls []string) map[string]string {
 	
 	wg.Wait()
 	return results
+}
+
+// PreloadImagesAsBase64 downloads images and converts them to base64 strings
+// This is faster than file-based approach as it avoids file I/O during PDF generation
+func PreloadImagesAsBase64(urls []string) map[string]string {
+	results := make(map[string]string)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// Limit concurrent downloads
+	sem := make(chan struct{}, 20)
+	
+	for _, url := range urls {
+		if url == "" {
+			continue
+		}
+		
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			
+			base64Data, err := getImageAsBase64(u)
+			if err == nil {
+				mu.Lock()
+				results[u] = base64Data
+				mu.Unlock()
+			}
+		}(url)
+	}
+	
+	wg.Wait()
+	return results
+}
+
+// getImageAsBase64 downloads an image, processes it (WebP conversion, normalization), and returns as base64
+func getImageAsBase64(url string) (string, error) {
+	// Download image
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to download: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("bad status: %s", resp.Status)
+	}
+	
+	// Read image data into memory
+	imageData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read image data: %w", err)
+	}
+	
+	// Decode image using imaging library (supports WebP, PNG, JPG, GIF)
+	img, err := imaging.Decode(bytes.NewReader(imageData))
+	if err != nil {
+		return "", fmt.Errorf("failed to decode image: %w", err)
+	}
+	
+	// Normalize to 8-bit NRGBA (gofpdf requirement)
+	nrgba := imaging.Clone(img)
+	
+	// Encode as PNG in memory
+	var buf bytes.Buffer
+	err = imaging.Encode(&buf, nrgba, imaging.PNG)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode PNG: %w", err)
+	}
+	
+	// Convert to base64
+	base64Data := base64.StdEncoding.EncodeToString(buf.Bytes())
+	
+	return base64Data, nil
 }
 
 // ============ QR CODE CACHING ============

@@ -4,6 +4,7 @@ import (
 	"badge-service/internal/cache"
 	"badge-service/internal/models"
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -22,13 +23,14 @@ import (
 
 // PDFGenerator handles PDF generation for badges
 type PDFGenerator struct {
-	template    *models.Template
-	user        *models.User
-	pdf         *gofpdf.Fpdf
-	imageCache  map[string]string // URL -> local path
-	scaleFactor float64           // Scale from mm to points
-	dpi         int               // DPI from template settings for font size conversion
-	debugLog    bool              // Enable debug logging
+	template        *models.Template
+	user            *models.User
+	pdf             *gofpdf.Fpdf
+	imageCache      map[string]string // URL -> local path (for backward compatibility)
+	imageBase64Cache map[string]string // URL -> base64 string (preferred, faster)
+	scaleFactor     float64           // Scale from mm to points
+	dpi             int               // DPI from template settings for font size conversion
+	debugLog        bool              // Enable debug logging
 }
 
 // NewPDFGenerator creates a new PDF generator instance
@@ -86,19 +88,25 @@ func NewPDFGenerator(template *models.Template, user *models.User) *PDFGenerator
 	debugLog := os.Getenv("DEBUG_PDF") == "true"
 	
 	return &PDFGenerator{
-		template:    template,
-		user:        user,
-		pdf:         pdf,
-		imageCache:  make(map[string]string),
-		scaleFactor: 1.0,
-		dpi:         dpi,
-		debugLog:    debugLog,
+		template:         template,
+		user:             user,
+		pdf:              pdf,
+		imageCache:       make(map[string]string),
+		imageBase64Cache: make(map[string]string),
+		scaleFactor:      1.0,
+		dpi:              dpi,
+		debugLog:         debugLog,
 	}
 }
 
-// SetImageCache sets pre-fetched image paths
+// SetImageCache sets pre-fetched image paths (for backward compatibility)
 func (g *PDFGenerator) SetImageCache(cache map[string]string) {
 	g.imageCache = cache
+}
+
+// SetImageBase64Cache sets pre-fetched images as base64 strings (preferred, faster)
+func (g *PDFGenerator) SetImageBase64Cache(cache map[string]string) {
+	g.imageBase64Cache = cache
 }
 
 // Generate creates the PDF and returns the bytes
@@ -365,6 +373,72 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		return nil // No image to render
 	}
 	
+	// Apply opacity check (gofpdf doesn't directly support opacity in ImageOptions)
+	// For opacity < 1, we would need to pre-process the image, but for now we'll render
+	// Opacity of 0 means fully transparent, skip rendering
+	opacity := layer.Style.Opacity
+	if opacity == 0 {
+		return nil // Fully transparent, skip rendering
+	}
+	
+	// Note: Rotation is not directly supported by gofpdf's ImageOptions
+	// For rotation support, we would need to pre-process the image using imaging library
+	// For now, we'll render without rotation (most templates use rotation: 0)
+	rotation := layer.Style.Rotation
+	if rotation != 0 {
+		fmt.Printf("Warning: Image rotation (%f degrees) not yet implemented for layer '%s'\n", rotation, layer.ID)
+		// TODO: Implement rotation using imaging library to pre-rotate the image
+	}
+	
+	// PREFERRED: Use base64 cache if available (much faster, no file I/O)
+	if base64Data, ok := g.imageBase64Cache[imageURL]; ok {
+		if g.debugLog {
+			fmt.Printf("Debug: Using base64 image for layer '%s' (size: %dx%dmm)\n", 
+				layer.ID, int(layer.Size.Width), int(layer.Size.Height))
+		}
+		// Determine image type from URL or base64 data
+		imageType := getImageTypeFromURL(imageURL)
+		if imageType == "" {
+			imageType = "PNG" // Default for base64 (already processed)
+		}
+		
+		// Register image from base64 and get name
+		imageName := fmt.Sprintf("img_%s", strings.ReplaceAll(imageURL, "/", "_"))
+		imageName = strings.ReplaceAll(imageName, ":", "_")
+		imageName = strings.ReplaceAll(imageName, ".", "_")
+		
+		// Decode base64 to bytes
+		imageData, err := base64.StdEncoding.DecodeString(base64Data)
+		if err != nil {
+			return fmt.Errorf("layer '%s': failed to decode base64 image: %w", layer.ID, err)
+		}
+		
+		// Register the image with gofpdf
+		info := g.pdf.RegisterImageOptionsReader(imageName, gofpdf.ImageOptions{
+			ImageType: imageType,
+		}, bytes.NewReader(imageData))
+		
+		if info == nil {
+			return fmt.Errorf("layer '%s': failed to register base64 image", layer.ID)
+		}
+		
+		// Draw the registered image
+		g.pdf.ImageOptions(
+			imageName,
+			x, y,
+			layer.Size.Width, layer.Size.Height,
+			false,
+			gofpdf.ImageOptions{ImageType: imageType},
+			0, "",
+		)
+		return nil
+	}
+	
+	// FALLBACK: Use file path (backward compatibility, slower)
+	if g.debugLog {
+		fmt.Printf("Debug: Using file path for layer '%s' (base64 not available)\n", layer.ID)
+	}
+	
 	// Get cached image path
 	var imagePath string
 	var err error
@@ -388,8 +462,7 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	// Determine image type
 	imageType := getImageType(imagePath)
 	
-	// Handle WebP conversion
-	isConvertedFromWebP := false
+	// Handle WebP conversion (only if not using base64)
 	if imageType == "WEBP" {
 		if g.debugLog {
 			fmt.Printf("Debug: Converting WebP to PNG for layer '%s': %s\n", layer.ID, imagePath)
@@ -402,77 +475,11 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		if stat, err := os.Stat(convertedPath); os.IsNotExist(err) || stat == nil || stat.Size() == 0 {
 			return fmt.Errorf("layer '%s': WebP conversion failed, converted file missing: %s", layer.ID, convertedPath)
 		}
-		// Update cache with converted path for future use (both original URL and converted path)
-		g.imageCache[imageURL] = convertedPath // Update original cache entry
-		g.imageCache[imageURL+".png"] = convertedPath // Also cache with .png suffix
 		imagePath = convertedPath
 		imageType = "PNG"
-		isConvertedFromWebP = true
-		if g.debugLog {
-			fmt.Printf("Debug: WebP converted successfully for layer '%s': %s -> %s (size: %dx%dmm)\n", 
-				layer.ID, imagePath, convertedPath, int(layer.Size.Width), int(layer.Size.Height))
-		}
 	}
 	
-	// Normalize PNG to 8-bit depth (gofpdf doesn't support 16-bit PNGs)
-	// Only normalize if it's a PNG (skip for JPG, GIF, etc.)
-	// Cache normalized path to avoid repeated normalization
-	// Force normalization for WebP-converted PNGs to ensure compatibility
-	if imageType == "PNG" {
-		// Check if image is small enough to skip normalization (optimization)
-		// QR codes and small icons are typically already 8-bit
-		// BUT: Always normalize WebP-converted PNGs to ensure compatibility
-		skipNormalization := !isConvertedFromWebP && layer.Size.Width < 50 && layer.Size.Height < 50
-		
-		normalizedCacheKey := imagePath + ".8bit"
-		if cachedPath, ok := g.imageCache[normalizedCacheKey]; ok {
-			// Use cached normalized path
-			imagePath = cachedPath
-			if g.debugLog {
-				fmt.Printf("Debug: Using cached normalized PNG for layer '%s': %s\n", layer.ID, imagePath)
-			}
-		} else if skipNormalization {
-			// For small images, skip normalization (likely already 8-bit)
-			// If it fails in PDF, it will be caught and we can normalize then
-			if g.debugLog {
-				fmt.Printf("Debug: Skipping normalization for small image (layer '%s'): %s\n", layer.ID, imagePath)
-			}
-		} else {
-			if g.debugLog {
-				fmt.Printf("Debug: Normalizing PNG for layer '%s': %s (converted from WebP: %v)\n", layer.ID, imagePath, isConvertedFromWebP)
-			}
-			normalizedPath, err := normalizePNGTo8Bit(imagePath)
-			if err != nil {
-				// If normalization fails, try using original (might already be 8-bit)
-				// This allows fallback for edge cases
-				fmt.Printf("Warning: PNG normalization failed for layer '%s', using original: %v\n", layer.ID, err)
-				normalizedPath = imagePath
-			}
-			// Cache the normalized path
-			g.imageCache[normalizedCacheKey] = normalizedPath
-			imagePath = normalizedPath
-		}
-	}
-	
-	// Apply opacity check (gofpdf doesn't directly support opacity in ImageOptions)
-	// For opacity < 1, we would need to pre-process the image, but for now we'll render
-	// Opacity of 0 means fully transparent, skip rendering
-	opacity := layer.Style.Opacity
-	if opacity == 0 {
-		return nil // Fully transparent, skip rendering
-	}
-	
-	// Note: Rotation is not directly supported by gofpdf's ImageOptions
-	// For rotation support, we would need to pre-process the image using imaging library
-	// For now, we'll render without rotation (most templates use rotation: 0)
-	rotation := layer.Style.Rotation
-	if rotation != 0 {
-		fmt.Printf("Warning: Image rotation (%f degrees) not yet implemented for layer '%s'\n", rotation, layer.ID)
-		// TODO: Implement rotation using imaging library to pre-rotate the image
-	}
-	
-	// Draw image (ImageOptions doesn't return error, but will panic if file is invalid)
-	// We've already validated the file exists above
+	// Draw image from file path
 	if g.debugLog {
 		fmt.Printf("Debug: Rendering image for layer '%s' at (%.2f, %.2f) size (%.2f x %.2f)mm from: %s\n", 
 			layer.ID, x, y, layer.Size.Width, layer.Size.Height, imagePath)
@@ -720,6 +727,31 @@ func getImageType(path string) string {
 		return "GIF"
 	case "webp":
 		return "WEBP"
+	default:
+		return "PNG"
+	}
+}
+
+func getImageTypeFromURL(url string) string {
+	// Extract extension from URL
+	lastDot := strings.LastIndex(url, ".")
+	if lastDot == -1 {
+		return "PNG" // Default
+	}
+	ext := strings.ToLower(url[lastDot+1:])
+	// Remove query parameters if any
+	if qIdx := strings.Index(ext, "?"); qIdx != -1 {
+		ext = ext[:qIdx]
+	}
+	switch ext {
+	case "jpg", "jpeg":
+		return "JPG"
+	case "png":
+		return "PNG"
+	case "gif":
+		return "GIF"
+	case "webp":
+		return "PNG" // WebP converted to PNG in base64
 	default:
 		return "PNG"
 	}

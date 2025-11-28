@@ -91,17 +91,17 @@ func GenerateBadge(c *fiber.Ctx) error {
 		}
 	}
 	
-	// Pre-fetch all images (only if there are images to fetch)
-	var imageCache map[string]string
+	// Pre-fetch all images as base64 (faster, no file I/O during PDF generation)
+	var imageBase64Cache map[string]string
 	if len(imageURLs) > 0 {
-		imageCache = cache.PreloadImages(imageURLs)
+		imageBase64Cache = cache.PreloadImagesAsBase64(imageURLs)
 	} else {
-		imageCache = make(map[string]string)
+		imageBase64Cache = make(map[string]string)
 	}
 	
 	// Generate PDF
 	gen := generator.NewPDFGenerator(&req.Template, &req.User.User)
-	gen.SetImageCache(imageCache)
+	gen.SetImageBase64Cache(imageBase64Cache)
 	
 	pdfBytes, err := gen.Generate()
 	if err != nil {
@@ -191,8 +191,8 @@ func GenerateBadgeBatch(c *fiber.Ctx) error {
 		}
 	}
 	
-	// Pre-fetch all images concurrently
-	imageCache := cache.PreloadImages(imageURLs)
+	// Pre-fetch all images as base64 concurrently (faster)
+	imageBase64Cache := cache.PreloadImagesAsBase64(imageURLs)
 	
 	// Generate PDFs concurrently
 	results := make([]models.BadgeResult, len(req.Users))
@@ -213,7 +213,7 @@ func GenerateBadgeBatch(c *fiber.Ctx) error {
 			
 			// Generate PDF
 			gen := generator.NewPDFGenerator(&req.Template, &user.User)
-			gen.SetImageCache(imageCache)
+			gen.SetImageBase64Cache(imageBase64Cache)
 			
 			pdfBytes, err := gen.Generate()
 			if err != nil {
