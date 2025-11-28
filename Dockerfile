@@ -1,8 +1,8 @@
 # Build stage
 FROM golang:1.21-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
+# Install build dependencies including libwebp for CGO
+RUN apk add --no-cache git ca-certificates tzdata gcc musl-dev libwebp-dev
 
 # Set working directory
 WORKDIR /app
@@ -16,19 +16,20 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/badge-service .
+# Build the application with CGO enabled for WebP support
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /app/badge-service .
 
 # Final stage
 FROM alpine:3.19
 
-# Install runtime dependencies
+# Install runtime dependencies including libwebp
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
     fontconfig \
     ttf-dejavu \
     ttf-liberation \
+    libwebp \
     && rm -rf /var/cache/apk/*
 
 # Create non-root user
