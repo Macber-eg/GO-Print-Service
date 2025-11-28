@@ -28,6 +28,7 @@ type PDFGenerator struct {
 	imageCache  map[string]string // URL -> local path
 	scaleFactor float64           // Scale from mm to points
 	dpi         int               // DPI from template settings for font size conversion
+	debugLog    bool              // Enable debug logging
 }
 
 // NewPDFGenerator creates a new PDF generator instance
@@ -81,6 +82,9 @@ func NewPDFGenerator(template *models.Template, user *models.User) *PDFGenerator
 		dpi = 300 // Standard print DPI
 	}
 	
+	// Check if debug logging is enabled
+	debugLog := os.Getenv("DEBUG_PDF") == "true"
+	
 	return &PDFGenerator{
 		template:    template,
 		user:        user,
@@ -88,6 +92,7 @@ func NewPDFGenerator(template *models.Template, user *models.User) *PDFGenerator
 		imageCache:  make(map[string]string),
 		scaleFactor: 1.0,
 		dpi:         dpi,
+		debugLog:    debugLog,
 	}
 }
 
@@ -162,11 +167,35 @@ func (g *PDFGenerator) renderText(layer models.Layer, x, y float64) error {
 		fontStyle = "B"
 	}
 	
-	// Calculate font size (convert from pixels to PDF points)
-	// Template font sizes are in pixels (px) at the template's DPI
-	// Conversion: pt = px * (72 / DPI)
-	// For 300 DPI: pt = px * 0.24
-	fontSize := layer.Style.FontSize * (72.0 / float64(g.dpi))
+	// Calculate font size - test both conversion methods
+	// Template font sizes might be in pixels (px) or points (pt)
+	// Method 1 (if px): pt = px * (72 / DPI) = px * 0.24 for 300 DPI
+	// Method 2 (if pt): use directly without conversion
+	fontSizeAsPx := layer.Style.FontSize * (72.0 / float64(g.dpi))
+	fontSizeAsPt := layer.Style.FontSize // Direct use (if already in points)
+	
+	// Check environment variable to determine which method to use
+	// FONT_SIZE_UNIT=pt means use directly, =px means convert, =auto means test both
+	fontSizeUnit := os.Getenv("FONT_SIZE_UNIT")
+	if fontSizeUnit == "" {
+		fontSizeUnit = "px" // Default to px conversion
+	}
+	
+	var fontSize float64
+	if fontSizeUnit == "pt" {
+		// Use directly as points (no conversion)
+		fontSize = fontSizeAsPt
+		fmt.Printf("Debug: Layer '%s' using PT method: %.2fpt (original=%.2f)\n", layer.ID, fontSize, layer.Style.FontSize)
+	} else if fontSizeUnit == "auto" {
+		// Test both - use px for now but log both
+		fontSize = fontSizeAsPx
+		fmt.Printf("Debug: Layer '%s' fontSize: original=%.2f, as_px=%.2fpt, as_pt=%.2fpt, DPI=%d, using=%.2fpt\n", 
+			layer.ID, layer.Style.FontSize, fontSizeAsPx, fontSizeAsPt, g.dpi, fontSize)
+	} else {
+		// Default: px conversion
+		fontSize = fontSizeAsPx
+		fmt.Printf("Debug: Layer '%s' using PX method: %.2fpt (original=%.2fpx, DPI=%d)\n", layer.ID, fontSize, layer.Style.FontSize, g.dpi)
+	}
 	
 	// Clamp font size to reasonable bounds
 	if fontSize < 4 {
@@ -177,8 +206,14 @@ func (g *PDFGenerator) renderText(layer models.Layer, x, y float64) error {
 	}
 	
 	// Auto font size: fit text to box
+	// Pass the base fontSize (converted) as maximum to respect template intent
 	if layer.AutoFontSize {
-		fontSize = g.calculateAutoFontSize(text, layer.Size.Width, layer.Size.Height, layer.Style.FontFamily, fontStyle)
+		// Use the converted fontSize as maximum - don't ignore template's intent
+		originalFontSize := fontSize
+		fontSize = g.calculateAutoFontSize(text, layer.Size.Width, layer.Size.Height, layer.Style.FontFamily, fontStyle, fontSize)
+		if g.debugLog {
+			fmt.Printf("Debug: Auto font size for layer '%s': calculated=%.2fpt (max was %.2fpt)\n", layer.ID, fontSize, originalFontSize)
+		}
 	}
 	
 	// Set font
@@ -289,7 +324,9 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 				if strings.Contains(key, layer.Content) {
 					imageURL = url
 					imageSource = "asset:" + key
-					fmt.Printf("Debug: Matched asset key '%s' to layer content '%s'\n", key, layer.Content)
+					if g.debugLog {
+						fmt.Printf("Debug: Matched asset key '%s' to layer content '%s'\n", key, layer.Content)
+					}
 					break
 				}
 			}
@@ -304,10 +341,12 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		if imageURL == "" {
 			fmt.Printf("Warning: dataBinding field '%s' not found or empty for layer '%s'\n", fieldID, layer.ID)
 			// Check if field exists but has empty value
-			for _, cf := range g.user.CustomFieldValues {
-				if cf.FieldID == fieldID {
-					fmt.Printf("Debug: Field '%s' exists but value is empty or not a valid URL\n", fieldID)
-					break
+			if g.debugLog {
+				for _, cf := range g.user.CustomFieldValues {
+					if cf.FieldID == fieldID {
+						fmt.Printf("Debug: Field '%s' exists but value is empty or not a valid URL\n", fieldID)
+						break
+					}
 				}
 			}
 		}
@@ -350,7 +389,11 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	imageType := getImageType(imagePath)
 	
 	// Handle WebP conversion
+	isConvertedFromWebP := false
 	if imageType == "WEBP" {
+		if g.debugLog {
+			fmt.Printf("Debug: Converting WebP to PNG for layer '%s': %s\n", layer.ID, imagePath)
+		}
 		convertedPath, err := convertWebPToPNG(imagePath)
 		if err != nil {
 			return fmt.Errorf("layer '%s': failed to convert WebP to PNG: %w", layer.ID, err)
@@ -359,31 +402,50 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		if stat, err := os.Stat(convertedPath); os.IsNotExist(err) || stat == nil || stat.Size() == 0 {
 			return fmt.Errorf("layer '%s': WebP conversion failed, converted file missing: %s", layer.ID, convertedPath)
 		}
+		// Update cache with converted path for future use (both original URL and converted path)
+		g.imageCache[imageURL] = convertedPath // Update original cache entry
+		g.imageCache[imageURL+".png"] = convertedPath // Also cache with .png suffix
 		imagePath = convertedPath
 		imageType = "PNG"
+		isConvertedFromWebP = true
+		if g.debugLog {
+			fmt.Printf("Debug: WebP converted successfully for layer '%s': %s -> %s (size: %dx%dmm)\n", 
+				layer.ID, imagePath, convertedPath, int(layer.Size.Width), int(layer.Size.Height))
+		}
 	}
 	
 	// Normalize PNG to 8-bit depth (gofpdf doesn't support 16-bit PNGs)
 	// Only normalize if it's a PNG (skip for JPG, GIF, etc.)
 	// Cache normalized path to avoid repeated normalization
-	// Skip normalization for very small images (likely already 8-bit, e.g., QR codes)
+	// Force normalization for WebP-converted PNGs to ensure compatibility
 	if imageType == "PNG" {
 		// Check if image is small enough to skip normalization (optimization)
 		// QR codes and small icons are typically already 8-bit
-		skipNormalization := layer.Size.Width < 50 && layer.Size.Height < 50
+		// BUT: Always normalize WebP-converted PNGs to ensure compatibility
+		skipNormalization := !isConvertedFromWebP && layer.Size.Width < 50 && layer.Size.Height < 50
 		
 		normalizedCacheKey := imagePath + ".8bit"
 		if cachedPath, ok := g.imageCache[normalizedCacheKey]; ok {
 			// Use cached normalized path
 			imagePath = cachedPath
+			if g.debugLog {
+				fmt.Printf("Debug: Using cached normalized PNG for layer '%s': %s\n", layer.ID, imagePath)
+			}
 		} else if skipNormalization {
 			// For small images, skip normalization (likely already 8-bit)
 			// If it fails in PDF, it will be caught and we can normalize then
+			if g.debugLog {
+				fmt.Printf("Debug: Skipping normalization for small image (layer '%s'): %s\n", layer.ID, imagePath)
+			}
 		} else {
+			if g.debugLog {
+				fmt.Printf("Debug: Normalizing PNG for layer '%s': %s (converted from WebP: %v)\n", layer.ID, imagePath, isConvertedFromWebP)
+			}
 			normalizedPath, err := normalizePNGTo8Bit(imagePath)
 			if err != nil {
 				// If normalization fails, try using original (might already be 8-bit)
 				// This allows fallback for edge cases
+				fmt.Printf("Warning: PNG normalization failed for layer '%s', using original: %v\n", layer.ID, err)
 				normalizedPath = imagePath
 			}
 			// Cache the normalized path
@@ -411,6 +473,10 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	
 	// Draw image (ImageOptions doesn't return error, but will panic if file is invalid)
 	// We've already validated the file exists above
+	if g.debugLog {
+		fmt.Printf("Debug: Rendering image for layer '%s' at (%.2f, %.2f) size (%.2f x %.2f)mm from: %s\n", 
+			layer.ID, x, y, layer.Size.Width, layer.Size.Height, imagePath)
+	}
 	g.pdf.ImageOptions(
 		imagePath,
 		x, y,
@@ -595,17 +661,25 @@ func (g *PDFGenerator) resolvePlaceholders(content string) string {
 
 // calculateAutoFontSize finds the best font size to fit text in a box
 // Uses DPI-aware calculations to match template behavior
-func (g *PDFGenerator) calculateAutoFontSize(text string, width, height float64, fontFamily, fontStyle string) float64 {
+// maxFontSize: The template's intended fontSize (after conversion) - don't exceed this
+func (g *PDFGenerator) calculateAutoFontSize(text string, width, height float64, fontFamily, fontStyle string, maxFontSize float64) float64 {
 	// Start with a reasonable size based on height (in mm, convert to points)
 	// Height is in mm, we want to use most of it for text
-	fontSize := height * 2.83 // Convert mm to points: 1mm ≈ 2.83pt
-	if fontSize > 24 {
-		fontSize = 24
+	// BUT: Don't exceed the template's intended fontSize
+	fontSizeFromHeight := height * 2.83 // Convert mm to points: 1mm ≈ 2.83pt
+	
+	// Use the minimum of height-based size and template's max fontSize
+	// This respects the template's intent while fitting to box
+	maxSize := fontSizeFromHeight
+	if maxFontSize > 0 && maxFontSize < maxSize {
+		maxSize = maxFontSize
+	}
+	if maxSize > 72 {
+		maxSize = 72
 	}
 	
 	// Binary search for optimal font size
 	minSize := 4.0
-	maxSize := fontSize
 	
 	for maxSize-minSize > 0.1 {
 		testSize := (minSize + maxSize) / 2
