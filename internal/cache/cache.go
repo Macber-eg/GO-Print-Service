@@ -47,9 +47,15 @@ func Init(cacheDir string) {
 		os.MkdirAll(filepath.Join(fileCacheDir, "templates"), 0755)
 		os.MkdirAll(filepath.Join(fileCacheDir, "qrcodes"), 0755)
 		
-		// HTTP client with timeout
+		// HTTP client with optimized timeout and connection pooling
+		transport := &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     90 * time.Second,
+		}
 		httpClient = &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   10 * time.Second, // Reduced from 30s for faster failure detection
+			Transport: transport,
 		}
 	})
 }
@@ -71,10 +77,10 @@ func GetImagePath(url string) (string, error) {
 	hash := md5.Sum([]byte(url))
 	cacheKey := hex.EncodeToString(hash[:])
 	
-	// Check memory cache for path
+	// Check memory cache for path (optimized: single stat call)
 	if cached, found := memCache.Get("img:" + cacheKey); found {
 		path := cached.(string)
-		if fileExists(path) {
+		if stat, err := os.Stat(path); err == nil && stat != nil && stat.Size() > 0 {
 			return path, nil
 		}
 	}
@@ -88,12 +94,13 @@ func GetImagePath(url string) (string, error) {
 	// File cache path
 	cachePath := filepath.Join(fileCacheDir, "images", cacheKey+ext)
 	
-	// Check if file exists on disk
+	// Check if file exists on disk (optimized: single check with stat)
 	fileMu.RLock()
-	exists := fileExists(cachePath)
+	stat, err := os.Stat(cachePath)
+	fileExists := err == nil && stat != nil && stat.Size() > 0
 	fileMu.RUnlock()
 	
-	if exists {
+	if fileExists {
 		memCache.Set("img:"+cacheKey, cachePath, gocache.DefaultExpiration)
 		return cachePath, nil
 	}
@@ -102,8 +109,8 @@ func GetImagePath(url string) (string, error) {
 	fileMu.Lock()
 	defer fileMu.Unlock()
 	
-	// Double-check after acquiring lock
-	if fileExists(cachePath) {
+	// Double-check after acquiring lock (optimized: single stat call)
+	if stat, err := os.Stat(cachePath); err == nil && stat != nil && stat.Size() > 0 {
 		memCache.Set("img:"+cacheKey, cachePath, gocache.DefaultExpiration)
 		return cachePath, nil
 	}

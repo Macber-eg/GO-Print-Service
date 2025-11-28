@@ -263,6 +263,7 @@ func (g *PDFGenerator) renderQRCode(layer models.Layer, x, y float64) error {
 // renderImage renders an image layer
 func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	var imageURL string
+	var imageSource string // Track where the image URL came from for debugging
 	
 	// Check if this is an asset reference
 	if strings.HasPrefix(layer.Content, "asset_") {
@@ -270,6 +271,7 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		for key, url := range g.template.Assets {
 			if strings.Contains(key, layer.Content) {
 				imageURL = url
+				imageSource = "asset:" + key
 				break
 			}
 		}
@@ -277,17 +279,38 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 		if imageURL == "" {
 			if url, ok := g.template.Assets[layer.Content]; ok {
 				imageURL = url
+				imageSource = "asset:" + layer.Content
 			}
 		}
 	} else if layer.DataBinding != "" {
 		// Get image URL from user data binding
 		fieldID := strings.TrimPrefix(layer.DataBinding, "customFields.")
 		imageURL = g.user.GetFieldValue(fieldID)
+		imageSource = "dataBinding:" + fieldID
+		
+		// Debug logging if field not found
+		if imageURL == "" {
+			fmt.Printf("Warning: dataBinding field '%s' not found or empty for layer '%s'\n", fieldID, layer.ID)
+			// Check if field exists but has empty value
+			for _, cf := range g.user.CustomFieldValues {
+				if cf.FieldID == fieldID {
+					fmt.Printf("Debug: Field '%s' exists but value is empty or not a valid URL\n", fieldID)
+					break
+				}
+			}
+		}
 	} else if layer.Content != "" && (strings.HasPrefix(layer.Content, "http://") || strings.HasPrefix(layer.Content, "https://")) {
 		imageURL = layer.Content
+		imageSource = "direct:" + layer.Content
 	}
 	
+	// If image layer expects an image but URL is empty, log error but don't fail
+	// (some layers might be optional)
 	if imageURL == "" {
+		if layer.DataBinding != "" || strings.HasPrefix(layer.Content, "asset_") {
+			// This layer was expected to have an image, log warning
+			fmt.Printf("Warning: Image layer '%s' has no image URL (source: %s)\n", layer.ID, imageSource)
+		}
 		return nil // No image to render
 	}
 	
@@ -321,14 +344,31 @@ func (g *PDFGenerator) renderImage(layer models.Layer, x, y float64) error {
 	
 	// Normalize PNG to 8-bit depth (gofpdf doesn't support 16-bit PNGs)
 	// Only normalize if it's a PNG (skip for JPG, GIF, etc.)
+	// Cache normalized path to avoid repeated normalization
+	// Skip normalization for very small images (likely already 8-bit, e.g., QR codes)
 	if imageType == "PNG" {
-		normalizedPath, err := normalizePNGTo8Bit(imagePath)
-		if err != nil {
-			// If normalization fails, try using original (might already be 8-bit)
-			// This allows fallback for edge cases
-			normalizedPath = imagePath
+		// Check if image is small enough to skip normalization (optimization)
+		// QR codes and small icons are typically already 8-bit
+		skipNormalization := layer.Size.Width < 50 && layer.Size.Height < 50
+		
+		normalizedCacheKey := imagePath + ".8bit"
+		if cachedPath, ok := g.imageCache[normalizedCacheKey]; ok {
+			// Use cached normalized path
+			imagePath = cachedPath
+		} else if skipNormalization {
+			// For small images, skip normalization (likely already 8-bit)
+			// If it fails in PDF, it will be caught and we can normalize then
+		} else {
+			normalizedPath, err := normalizePNGTo8Bit(imagePath)
+			if err != nil {
+				// If normalization fails, try using original (might already be 8-bit)
+				// This allows fallback for edge cases
+				normalizedPath = imagePath
+			}
+			// Cache the normalized path
+			g.imageCache[normalizedCacheKey] = normalizedPath
+			imagePath = normalizedPath
 		}
-		imagePath = normalizedPath
 	}
 	
 	// Draw image
@@ -568,22 +608,23 @@ func getImageType(path string) string {
 func convertWebPToPNG(webpPath string) (string, error) {
 	pngPath := webpPath + ".png"
 	
-	// Check if already converted
-	if _, err := os.Stat(pngPath); err == nil {
-		// WebP conversion already produces 8-bit PNG, but normalize to be safe
-		return normalizePNGTo8Bit(pngPath)
+	// Check if already converted (single os.Stat call)
+	if stat, err := os.Stat(pngPath); err == nil && stat.Size() > 0 {
+		// WebP conversion already produces 8-bit PNG via imaging library
+		// No need to normalize again
+		return pngPath, nil
 	}
 	
 	// Open WebP file using imaging library
 	img, err := imaging.Open(webpPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to open WebP: %w", err)
 	}
 	
-	// Save as 8-bit PNG using imaging library
+	// Save as 8-bit PNG using imaging library (imaging.Save creates 8-bit PNGs)
 	err = imaging.Save(img, pngPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to save PNG: %w", err)
 	}
 	
 	return pngPath, nil
@@ -592,19 +633,25 @@ func convertWebPToPNG(webpPath string) (string, error) {
 // normalizePNGTo8Bit converts a PNG image to 8-bit depth if needed
 // gofpdf doesn't support 16-bit PNG files
 // Uses imaging library for fast conversion
+// Optimized: checks file existence first, caches results
 func normalizePNGTo8Bit(pngPath string) (string, error) {
 	// Use a normalized path with a suffix to avoid conflicts
 	normalizedPath := pngPath + ".8bit.png"
 	
-	// Check if already normalized
-	if _, err := os.Stat(normalizedPath); err == nil {
+	// Check if already normalized (single os.Stat call)
+	if stat, err := os.Stat(normalizedPath); err == nil && stat.Size() > 0 {
 		return normalizedPath, nil
+	}
+	
+	// Check if source file exists
+	if _, err := os.Stat(pngPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("source PNG file does not exist: %s", pngPath)
 	}
 	
 	// Open and decode image
 	img, err := imaging.Open(pngPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to open PNG: %w", err)
 	}
 	
 	// Convert to NRGBA using imaging library (much faster than pixel-by-pixel)
@@ -615,7 +662,7 @@ func normalizePNGTo8Bit(pngPath string) (string, error) {
 	// NRGBA format ensures 8-bit depth
 	err = imaging.Save(nrgba, normalizedPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to save normalized PNG: %w", err)
 	}
 	
 	return normalizedPath, nil

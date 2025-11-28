@@ -55,14 +55,39 @@ func GenerateBadge(c *fiber.Ctx) error {
 	
 	// Pre-cache template background and user photos
 	var imageURLs []string
+	
+	// Collect template assets
 	for _, url := range req.Template.Assets {
-		imageURLs = append(imageURLs, url)
+		if url != "" {
+			imageURLs = append(imageURLs, url)
+		}
 	}
 	
-	// Pre-cache user photo
+	// Collect user photos from customFieldValues
 	for _, cf := range req.User.User.CustomFieldValues {
-		if cf.FieldType == "file" && cf.Value != "" && strings.HasPrefix(cf.Value, "http") {
+		if cf.FieldType == "file" && cf.Value != "" && (strings.HasPrefix(cf.Value, "http://") || strings.HasPrefix(cf.Value, "https://")) {
 			imageURLs = append(imageURLs, cf.Value)
+		}
+	}
+	
+	// Also check dataBinding fields in template layers to ensure all images are preloaded
+	for _, layer := range req.Template.Design.Layers {
+		if layer.Type == "image" && layer.DataBinding != "" {
+			fieldID := strings.TrimPrefix(layer.DataBinding, "customFields.")
+			imageURL := req.User.User.GetFieldValue(fieldID)
+			if imageURL != "" && (strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://")) {
+				// Check if already in list
+				found := false
+				for _, url := range imageURLs {
+					if url == imageURL {
+						found = true
+						break
+					}
+				}
+				if !found {
+					imageURLs = append(imageURLs, imageURL)
+				}
+			}
 		}
 	}
 	
@@ -128,17 +153,40 @@ func GenerateBadgeBatch(c *fiber.Ctx) error {
 	
 	// Collect all image URLs to pre-fetch
 	var imageURLs []string
+	urlSet := make(map[string]bool) // Deduplicate URLs
 	
 	// Template assets
 	for _, url := range req.Template.Assets {
-		imageURLs = append(imageURLs, url)
+		if url != "" && !urlSet[url] {
+			imageURLs = append(imageURLs, url)
+			urlSet[url] = true
+		}
 	}
 	
-	// User photos
+	// User photos from customFieldValues
 	for _, userData := range req.Users {
 		for _, cf := range userData.User.CustomFieldValues {
-			if cf.FieldType == "file" && cf.Value != "" && strings.HasPrefix(cf.Value, "http") {
-				imageURLs = append(imageURLs, cf.Value)
+			if cf.FieldType == "file" && cf.Value != "" && (strings.HasPrefix(cf.Value, "http://") || strings.HasPrefix(cf.Value, "https://")) {
+				if !urlSet[cf.Value] {
+					imageURLs = append(imageURLs, cf.Value)
+					urlSet[cf.Value] = true
+				}
+			}
+		}
+	}
+	
+	// Also check dataBinding fields in template layers to ensure all images are preloaded
+	for _, layer := range req.Template.Design.Layers {
+		if layer.Type == "image" && layer.DataBinding != "" {
+			fieldID := strings.TrimPrefix(layer.DataBinding, "customFields.")
+			for _, userData := range req.Users {
+				imageURL := userData.User.GetFieldValue(fieldID)
+				if imageURL != "" && (strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://")) {
+					if !urlSet[imageURL] {
+						imageURLs = append(imageURLs, imageURL)
+						urlSet[imageURL] = true
+					}
+				}
 			}
 		}
 	}
